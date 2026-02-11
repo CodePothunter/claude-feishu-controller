@@ -452,9 +452,10 @@ async function main() {
     if (sessionManager.getCurrentSession()) {
       const sessionName = sessionManager.getCurrentSession();
       commander = new TmuxCommander(sessionName);
-      // 设置 transcript 监控的 tmux session，使其能够动态获取工作目录
+      // 设置 transcript 监控的 tmux session 和 commander，使其能够动态获取工作目录并检测 Plan Mode
       if (transcriptMonitor) {
-        transcriptMonitor.tmuxSessionName = sessionName;
+        transcriptMonitor.setTmuxSession(sessionName);
+        transcriptMonitor.setTmuxCommander(commander);
         Logger.info(`📝 Transcript 监控将跟踪 tmux 会话: ${sessionName}`);
       }
       startMonitorPolling();

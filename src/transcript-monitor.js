@@ -325,10 +325,14 @@ export class TranscriptMonitor {
     this.lastSessionCheckTime = null;
     this.sessionCheckInterval = 10000; // 每 10 秒强制刷新一次 session ID
 
-    // 内存监控
-    this.lastMemoryCheck = Date.now();
-    this.memoryCheckInterval = 10000; // 每 10 秒检查一次
-    this.heapThreshold = 500 * 1024 * 1024; // 500MB 阈值
+    // Tmux commander（用于获取终端内容）
+    this.tmuxCommander = options.tmuxCommander || null;
+
+    // Plan Mode 检测状态
+    this.lastPlanModeCheck = 0;
+    this.planModeCheckInterval = 5000; // 每 5 秒检查一次 Plan Mode
+    this.lastNotifiedPlanModeContent = null; // 上次通知的 Plan Mode 内容哈希
+    this.lastPlanModeNotifyTime = null; // 上次通知的时间戳
 
     // 初始化交互消息解析器
     this.interactionParser = new InteractionParser();
@@ -352,6 +356,15 @@ export class TranscriptMonitor {
    */
   setMessenger(messenger) {
     this.messenger = messenger;
+  }
+
+  /**
+   * 设置 tmux commander（用于获取终端内容）
+   * @param {Object} tmuxCommander - tmux 命令执行器实例
+   */
+  setTmuxCommander(tmuxCommander) {
+    this.tmuxCommander = tmuxCommander;
+    Logger.transcript('已设置 Tmux Commander');
   }
 
   /**
@@ -868,13 +881,15 @@ export class TranscriptMonitor {
   }
 
   /**
-   * 处理交互消息（AskUserQuestion 等）
+   * 处理交互消息（AskUserQuestion, ExitPlanMode 等）
    * @param {Object} interaction - 交互消息对象
    */
   async handleInteraction(interaction) {
     try {
       if (interaction.type === InteractionType.ASK_USER_QUESTION) {
         await this.handleAskUserQuestion(interaction);
+      } else if (interaction.type === InteractionType.EXIT_PLAN_MODE) {
+        await this.handleExitPlanMode(interaction);
       }
       // 未来可扩展其他交互类型
     } catch (error) {
@@ -924,6 +939,81 @@ export class TranscriptMonitor {
       await this.messenger.sendText(message);
       Logger.transcript(`已发送 AskUserQuestion (降级格式): ${question.header || question.text.substring(0, 30)}`);
     }
+
+    // 如果有回调，也通知调用方
+    if (this.onInteraction) {
+      try {
+        await this.onInteraction(interaction);
+      } catch (error) {
+        Logger.error(`交互回调执行失败: ${error.message}`);
+      }
+    }
+  }
+
+  /**
+   * 处理 ExitPlanMode 交互（Plan Mode 完成确认）
+   * @param {Object} interaction - ExitPlanMode 交互数据
+   */
+  async handleExitPlanMode(interaction) {
+    const { question, planFilePath } = interaction;
+
+    if (!this.messenger) {
+      Logger.warn('Messenger 未设置，无法发送交互消息');
+      return;
+    }
+
+    let planContent = null;
+
+    // 尝试读取计划文件内容
+    if (planFilePath) {
+      try {
+        // 展开波浪号路径
+        let fullPath = planFilePath;
+        if (fullPath.startsWith('~/')) {
+          const homeDir = process.env.HOME || '/home/ubuntu';
+          fullPath = path.join(homeDir, fullPath.substring(2));
+        }
+
+        // 检查文件是否存在
+        if (fs.existsSync(fullPath)) {
+          planContent = fs.readFileSync(fullPath, 'utf-8');
+          Logger.transcript(`已读取计划文件: ${fullPath} (${planContent.length} 字符)`);
+        } else {
+          Logger.warn(`计划文件不存在: ${fullPath}`);
+        }
+      } catch (error) {
+        Logger.error(`读取计划文件失败: ${error.message}`);
+      }
+    }
+
+    // 构建消息
+    let message = `📋 **${question.header}**\n\n`;
+
+    if (planContent) {
+      // 添加计划文件内容（使用 Markdown 格式）
+      message += `**📄 计划内容** (\`${planFilePath}\`):\n\n`;
+
+      // 限制计划内容长度，避免消息过长
+      const maxPlanLength = 5000;
+      if (planContent.length > maxPlanLength) {
+        planContent = planContent.slice(0, maxPlanLength) + `\n\n... (计划过长，已截断，共 ${planContent.length} 字符)`;
+      }
+
+      message += `${planContent}\n\n`;
+    } else if (planFilePath) {
+      message += `📄 计划文件: \`${planFilePath}\`\n\n`;
+    }
+
+    message += `**请选择下一步操作：**\n\n`;
+    if (question.options && question.options.length > 0) {
+      for (const opt of question.options) {
+        message += `${opt.num}. ${opt.label}\n`;
+      }
+    }
+    message += `\n💡 回复数字选择操作`;
+
+    await this.messenger.sendText(message);
+    Logger.transcript(`已发送 ExitPlanMode: ${planFilePath || '无文件路径'} (${planContent ? planContent.length : 0} 字符)`);
 
     // 如果有回调，也通知调用方
     if (this.onInteraction) {
@@ -1096,6 +1186,12 @@ export class TranscriptMonitor {
         this.waitingForNewSession = false;
         this.lastProcessedSessionId = null;
       }
+    }
+
+    // 检测 Plan Mode 完成确认（通过 tmux 终端内容）
+    if (this.tmuxCommander && (now - this.lastPlanModeCheck > this.planModeCheckInterval)) {
+      this.lastPlanModeCheck = now;
+      await this.checkPlanMode();
     }
 
     try {
@@ -1309,6 +1405,67 @@ export class TranscriptMonitor {
     }
 
     Logger.transcript('transcript 监控已停止');
+  }
+
+  /**
+   * 检查 Plan Mode 完成确认状态
+   * 通过 tmux 终端内容检测（不在 transcript.jsonl 中）
+   */
+  async checkPlanMode() {
+    if (!this.tmuxCommander || !this.messenger) {
+      return;
+    }
+
+    try {
+      // 捕获 tmux 终端内容
+      const tmuxContent = await this.tmuxCommander.capture(100);
+      if (!tmuxContent || tmuxContent.trim().length === 0) {
+        return;
+      }
+
+      // 使用 interactionParser 检测 Plan Mode
+      const isPlanMode = this.interactionParser.isExitPlanMode(tmuxContent);
+
+      if (isPlanMode) {
+        // 检查内容是否与上次通知的相同（避免重复通知）
+        const contentHash = this._hashPlanModeContent(tmuxContent);
+        const now = Date.now();
+
+        // 如果内容相同且上次通知时间在 5 分钟内，跳过
+        if (contentHash === this.lastNotifiedPlanModeContent &&
+            this.lastPlanModeNotifyTime &&
+            (now - this.lastPlanModeNotifyTime) < 300000) {
+          return;
+        }
+
+        // 解析 Plan Mode
+        const interaction = this.interactionParser.parseExitPlanMode(tmuxContent);
+        if (interaction) {
+          await this.handleInteraction(interaction);
+          this.lastNotifiedPlanModeContent = contentHash;
+          this.lastPlanModeNotifyTime = now;
+          Logger.transcript(`已发送 Plan Mode 通知`);
+        }
+      } else {
+        // 不在 Plan Mode 时，重置通知记录
+        this.lastNotifiedPlanModeContent = null;
+        this.lastPlanModeNotifyTime = null;
+      }
+    } catch (error) {
+      Logger.error(`检查 Plan Mode 失败: ${error.message}`);
+    }
+  }
+
+  /**
+   * 生成 Plan Mode 内容的哈希值（用于去重）
+   * @param {string} content - tmux 内容
+   * @returns {string} - 哈希值
+   */
+  _hashPlanModeContent(content) {
+    // 只哈�选项部分，忽略时间戳等变化内容
+    const lines = content.split('\n');
+    const optionLines = lines.filter(line => /^\s*❯\s*\d+\./.test(line) || /^\s*\d+\.\s+Yes/.test(line));
+    return optionLines.join('|');
   }
 }
 
