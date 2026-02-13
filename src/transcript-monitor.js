@@ -791,8 +791,46 @@ export class TranscriptMonitor {
       data.message.role === 'assistant' &&
       data.uuid &&
       !this.processedMessages.has(data.uuid) &&
-      !this.stateStore.hasUuid(data.uuid)  // 检查持久化存储
+      !this.stateStore.hasUuid(data.uuid) &&  // 检查持久化存储
+      this.isMessageWithinTTL(data)  // 检查消息时间戳是否在有效期内
     );
+  }
+
+  /**
+   * 检查消息时间戳是否在有效期内
+   * 用于过滤服务重启后从文件头部读取的历史消息
+   * @param {Object} data - 消息数据
+   * @returns {boolean} - true 表示消息在有效期内
+   */
+  isMessageWithinTTL(data) {
+    // 如果没有 timestamp 字段，按容错策略视为有效
+    if (!data.timestamp) {
+      return true;
+    }
+
+    try {
+      const messageTime = new Date(data.timestamp).getTime();
+
+      // NaN 检查（无效的时间格式）
+      if (isNaN(messageTime)) {
+        Logger.warn(`消息时间戳格式错误: ${data.timestamp}, uuid: ${data.uuid}`);
+        return true; // 容错：视为有效
+      }
+
+      const now = Date.now();
+      const age = now - messageTime;
+
+      // 超过 TTL 的消息视为过期
+      if (age > this.processedMessagesTTL) {
+        Logger.debug(`跳过过期消息: uuid=${data.uuid}, age=${Math.round(age/1000)}s`);
+        return false;
+      }
+
+      return true;
+    } catch (error) {
+      Logger.warn(`解析消息时间戳失败: ${error.message}, uuid: ${data.uuid}`);
+      return true; // 容错：视为有效
+    }
   }
 
   /**
