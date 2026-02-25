@@ -82,6 +82,9 @@ export class MessageRouter {
     // /dedup-stats
     this.commandHandlers.set('dedup-stats', async () => commands.handleDedupStats(this.context));
 
+    // /dedupstats (Discord slash command 别名，命令名不能含 -)
+    this.commandHandlers.set('dedupstats', async () => commands.handleDedupStats(this.context));
+
     // /reset - 清除 Claude Code context
     this.commandHandlers.set('reset', async () => commands.handleReset(this.context));
   }

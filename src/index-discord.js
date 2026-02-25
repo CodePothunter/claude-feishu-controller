@@ -16,6 +16,8 @@ import { MessageDeduplicator } from './utils/deduplicator.js';
 import { MessageHistory } from './utils/message-history.js';
 import { TranscriptMonitor } from './transcript-monitor.js';
 import { ProcessManager } from './utils/process-manager.js';
+import { registerCommands } from './discord-commands.js';
+import * as commands from './handlers/command.js';
 import Logger from './utils/logger.js';
 
 // 代理由 discord-proxy-bootstrap.mjs 通过 --import 配置
@@ -222,6 +224,191 @@ async function handleDiscordMessage(message) {
 }
 
 /**
+ * 处理 Discord Slash Command 交互
+ * @param {Object} interaction - discord.js Interaction 对象
+ */
+async function handleInteraction(interaction) {
+  try {
+    // 只处理 Chat Input Commands
+    if (!interaction.isChatInputCommand()) {
+      return;
+    }
+
+    // 过滤非目标频道
+    if (interaction.channelId !== config.discord.channelId) {
+      return;
+    }
+
+    const commandName = interaction.commandName;
+    Logger.info(`📨 处理 Slash Command: /${commandName}`);
+
+    // 先 defer reply，给后续处理留出时间
+    await interaction.deferReply();
+
+    // 创建交互专用 context，用 interaction.editReply / followUp 替代 channel.send
+    let replied = false;
+    const interactionSendText = async (text, options = {}) => {
+      const chunks = messenger.splitMessage(text);
+      for (const chunk of chunks) {
+        if (!replied) {
+          await interaction.editReply(chunk);
+          replied = true;
+        } else {
+          await interaction.followUp(chunk);
+        }
+      }
+    };
+
+    const interactionCtx = {
+      messenger: {
+        ...messenger,
+        sendText: interactionSendText,
+        // override sendHelp 使其通过 interaction 回复
+        sendHelp: async () => {
+          try {
+            const { EmbedBuilder } = await import('discord.js');
+            const embed = new EmbedBuilder()
+              .setTitle('📖 Claude Code Discord 桥接 - 帮助')
+              .setColor(0x7C3AED)
+              .addFields(
+                {
+                  name: '🔔 监控功能',
+                  value: [
+                    '• 自动检测 Claude Code 等待输入',
+                    '• 检测错误、警告、测试执行等状态',
+                    '• Discord 消息实时通知',
+                  ].join('\n'),
+                },
+                {
+                  name: '💬 使用规则',
+                  value: [
+                    '**普通文本** → 直接发送给 Claude Code',
+                    '**yes/y/确认** → 确认 Claude Code 请求',
+                    '**no/n/取消** → 取消 Claude Code 操作',
+                    '**!命令** → 在 tmux 中执行命令并返回结果',
+                  ].join('\n'),
+                },
+                {
+                  name: '🎛️ 桥接服务指令',
+                  value: [
+                    '`/switch` — 列出所有 tmux 会话',
+                    '`/switch <名>` — 切换监控到指定会话',
+                    '`/tab <数字>` — 选中指定 tab',
+                    '`/show` — 显示当前 tmux 会话内容',
+                    '`/new <名字>` — 创建新的 tmux 会话',
+                    '`/kill` — 杀掉当前 tmux 会话',
+                    '`/reset` — 清除 Claude Code context',
+                    '`/history` — 查看命令历史',
+                    '`/status` — 显示详细状态信息',
+                    '`/help` — 显示此帮助信息',
+                  ].join('\n'),
+                },
+                {
+                  name: '💡 示例',
+                  value: '`!pwd` — 显示当前目录\n`!ls -la` — 列出文件\n`!git status` — 查看 git 状态',
+                }
+              );
+
+            if (!replied) {
+              await interaction.editReply({ embeds: [embed] });
+              replied = true;
+            } else {
+              await interaction.followUp({ embeds: [embed] });
+            }
+            return { success: true };
+          } catch (error) {
+            // 降级为纯文本
+            await interactionSendText(
+              '📖 **Claude Code Discord 桥接 - 帮助**\n\n' +
+              '**普通文本** → 发送给 Claude Code\n' +
+              '**yes/no** → 确认/取消操作\n' +
+              '**!命令** → 执行命令并返回结果\n' +
+              '`/switch` `/show` `/new` `/kill` `/reset` `/status` `/help`'
+            );
+            return { success: false, error: error.message };
+          }
+        },
+      },
+      commander,
+      currentSession: sessionManager.getSessionRef(),
+      sessionManager,
+      monitorState: router ? router.context.monitorState : 'idle',
+      sendText: interactionSendText,
+      deduplicator,
+      transcriptMonitor,
+    };
+
+    // 根据 commandName 分发到对应的 command handler
+    switch (commandName) {
+      case 'switch': {
+        const name = interaction.options.getString('name');
+        if (name) {
+          await commands.handleSwitchTo(interactionCtx, name);
+        } else {
+          await commands.handleSwitchList(interactionCtx);
+        }
+        break;
+      }
+      case 'tab': {
+        const numbers = interaction.options.getString('numbers');
+        await commands.handleTab(interactionCtx, numbers);
+        break;
+      }
+      case 'show':
+        await commands.handleShow(interactionCtx);
+        break;
+      case 'new': {
+        const name = interaction.options.getString('name');
+        await commands.handleNew(interactionCtx, name);
+        break;
+      }
+      case 'kill':
+        await commands.handleKill(interactionCtx);
+        break;
+      case 'help':
+        await commands.handleHelp(interactionCtx);
+        break;
+      case 'history':
+        await commands.handleHistory(interactionCtx);
+        break;
+      case 'status':
+        await commands.handleStatus(interactionCtx, interactionCtx.monitorState);
+        break;
+      case 'config':
+        await commands.handleConfig(interactionCtx);
+        break;
+      case 'watch':
+        await commands.handleWatch(interactionCtx);
+        break;
+      case 'clear':
+        await commands.handleClear(interactionCtx);
+        break;
+      case 'dedupstats':
+        await commands.handleDedupStats(interactionCtx);
+        break;
+      case 'reset':
+        await commands.handleReset(interactionCtx);
+        break;
+      default:
+        await interactionSendText(`❓ 未知指令: /${commandName}`);
+        break;
+    }
+  } catch (error) {
+    Logger.error(`处理 Slash Command 交互时出错: ${error.message}`);
+    try {
+      // 尝试回复错误信息
+      if (interaction.deferred || interaction.replied) {
+        await interaction.followUp(`❌ 命令执行失败: ${error.message}`);
+      } else {
+        await interaction.reply(`❌ 命令执行失败: ${error.message}`);
+      }
+    } catch (replyError) {
+      Logger.error(`回复错误信息失败: ${replyError.message}`);
+    }
+  }
+}
+
+/**
  * 优雅关闭
  */
 async function shutdown() {
@@ -362,9 +549,21 @@ async function main() {
     }
 
     // 注册 Discord 事件
-    discordClient.once(Events.ClientReady, (client) => {
+    discordClient.once(Events.ClientReady, async (client) => {
       Logger.success(`Discord Bot 已登录: ${client.user.tag}`);
       isDiscordConnected = true;
+
+      // 注册 Guild Slash Commands（从频道获取 guildId，秒级生效）
+      try {
+        const channel = await client.channels.fetch(config.discord.channelId);
+        if (channel && channel.guildId) {
+          await registerCommands(client.user.id, channel.guildId, config.discord.botToken);
+        } else {
+          Logger.error('无法从频道获取 guildId，Slash Commands 未注册');
+        }
+      } catch (error) {
+        Logger.error(`Slash Commands 注册失败，交互命令将不可用: ${error.message}`);
+      }
 
       // Discord 已就绪，启动 transcript 监控
       transcriptMonitor.start();
@@ -376,6 +575,7 @@ async function main() {
     });
 
     discordClient.on(Events.MessageCreate, handleDiscordMessage);
+    discordClient.on(Events.InteractionCreate, handleInteraction);
 
     discordClient.on(Events.Error, (error) => {
       Logger.error(`Discord 客户端错误: ${error.message}`);
